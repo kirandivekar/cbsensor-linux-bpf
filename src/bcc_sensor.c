@@ -152,7 +152,7 @@ struct data_t
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
 BPF_HASH(last_start_time, u32, u64, 8192);
 BPF_HASH(last_parent, u32, u32, 8192);
-BPF_HASH(root_fs, u32, u64, 3); // stores last known root fs
+BPF_HASH(root_fs, u32, void *, 3); // stores last known root fs
 #endif
 
 BPF_PERF_OUTPUT(events);
@@ -439,13 +439,13 @@ static inline int __do_file_path(struct pt_regs *ctx,
     }
 #else
     u32 index = 0;
-    struct dentry **t_dentry = root_fs.lookup(&index);
+    struct dentry **t_dentry = (struct dentry **)root_fs.lookup(&index);
     if (t_dentry)
     {
       root_fs_dentry = *t_dentry;
     }
     index = 1;
-    struct vfsmount **t_vfsmount = root_fs.lookup(&index);
+    struct vfsmount **t_vfsmount = (struct vfsmount **)root_fs.lookup(&index);
     if (t_vfsmount)
     {
       root_fs_vfsmnt = *t_vfsmount;
@@ -968,9 +968,9 @@ int on_wake_up_new_task(struct pt_regs *ctx, struct task_struct *task)
     struct dentry *root_fs_dentry = task->fs->root.dentry;
     struct vfsmount *root_fs_vfsmount = task->fs->root.mnt;
     index = 0;
-    root_fs.update(&index, &root_fs_dentry);
+    root_fs.update(&index, (void *)&root_fs_dentry);
     index += 1;
-    root_fs.update(&index, &root_fs_vfsmount);
+    root_fs.update(&index, (void *)&root_fs_vfsmount);
 #endif
 
     // Get this in case it's a non-standard process
@@ -1035,25 +1035,25 @@ BPF_LRU(ip6_cache, struct ip6_key, struct ip_entry);
 static inline bool has_ip_cache(struct ip_key *ip_key, u8 flow)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
-    struct ip_key *ip_entry = ip_cache.lookup(&ip_key->pid);
+    struct ip_entry *ip_entry = ip_cache.lookup(ip_key);
     if (ip_entry)
     {
-        if (ip_entry->dport == ip_key->remote_port &&
-            ip_entry->sport == ip_key->local_port &&
-            ip_entry->daddr == ip_key->remote_addr &&
-            ip_entry->saddr == ip_key->local_addr)
+        if ((ip_entry->flow & flow))
         {
             return true;
         }
         else
         {
             // Update entry
-            ip_cache.update(&ip_key->pid, ip_key);
+            ip_entry->flow |= flow;
+            ip_cache.update(ip_key, ip_entry);
         }
     }
     else
     {
-        ip_cache.insert(&ip_key->pid, ip_key);
+        struct ip_entry new_entry = {};
+        new_entry.flow = flow;
+        ip_cache.insert(ip_key, &new_entry);
     }
 #else
     struct ip_entry *ip_entry = ip_cache.lookup(ip_key);
@@ -1065,6 +1065,7 @@ static inline bool has_ip_cache(struct ip_key *ip_key, u8 flow)
         }
         // Updates map entry
         ip_entry->flow |= flow;
+        ip_cache.update(ip_key, ip_entry);
     }
     else
     {
@@ -1080,31 +1081,25 @@ static inline bool has_ip_cache(struct ip_key *ip_key, u8 flow)
 static inline bool has_ip6_cache(struct ip6_key *ip6_key, u8 flow)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
-    struct ip6_key *ip_entry = ip6_cache.lookup(&ip6_key->pid);
+    struct ip_entry *ip_entry = ip6_cache.lookup(ip6_key);
     if (ip_entry)
     {
-        if (ip_entry->dport == ip6_key->remote_port &&
-            ip_entry->sport == ip6_key->local_port &&
-            ip_entry->daddr6[0] == ip6_key->remote_addr6[0] &&
-            ip_entry->daddr6[1] == ip6_key->remote_addr6[1] &&
-            ip_entry->daddr6[2] == ip6_key->remote_addr6[2] &&
-            ip_entry->daddr6[3] == ip6_key->remote_addr6[3] &&
-            ip_entry->saddr6[0] == ip6_key->local_addr6[0] &&
-            ip_entry->saddr6[1] == ip6_key->local_addr6[1] &&
-            ip_entry->saddr6[2] == ip6_key->local_addr6[2] &&
-            ip_entry->saddr6[3] == ip6_key->local_addr6[3])
+        if ((ip_entry->flow & flow))
         {
             return true;
         }
         else
         {
             // Update entry
-            ip6_cache.update(&ip6_key->pid, ip6_key);
+            ip_entry->flow |= flow;
+            ip6_cache.update(ip6_key, ip_entry);
         }
     }
     else
     {
-        ip6_cache.insert(&ip6_key->pid, ip6_key);
+        struct ip_entry new_entry = {};
+        new_entry.flow = flow;
+        ip6_cache.insert(ip6_key, &new_entry);
     }
 #else
     struct ip_entry *ip_entry = ip6_cache.lookup(ip6_key);
@@ -1116,6 +1111,7 @@ static inline bool has_ip6_cache(struct ip6_key *ip6_key, u8 flow)
         }
         // Updates map entry
         ip_entry->flow |= flow;
+        ip6_cache.update(ip6_key, ip_entry);
     }
     else
     {
@@ -1155,8 +1151,10 @@ int on_security_task_free(struct pt_regs *ctx, struct task_struct *task)
     last_parent.delete(&data.pid);
 #ifdef CACHE_UDP
     // Remove burst cache entries
-    ip_cache.delete(&data.pid);
-    ip6_cache.delete(&data.pid);
+    //  We only need to do this for older kernels that do not have an LRU
+    // TODO: Find a way to clean this up
+    // ip_cache.delete(&data.pid);
+    // ip6_cache.delete(&data.pid);
 #endif /* CACHE_UDP */
 #endif
 out:
